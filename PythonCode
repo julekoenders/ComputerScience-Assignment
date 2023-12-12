@@ -1,0 +1,779 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[72]:
+
+
+import pandas as pd
+import numpy as np
+import seaborn as sns 
+import json 
+import re 
+import random
+from sklearn.feature_extraction.text import CountVectorizer
+import itertools
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.metrics import confusion_matrix
+from sklearn.metrics import precision_recall_fscore_support
+from scipy.sparse import csr_matrix
+import matplotlib.pyplot as plt
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import pdist
+from scipy.spatial.distance import euclidean, cityblock
+from sklearn.feature_extraction.text import TfidfVectorizer
+from itertools import combinations  
+from collections import Counter
+import statsmodels.api as sm
+from sklearn.cluster import AgglomerativeClustering
+
+
+
+# ## Pre-Processing Dataset 
+
+# In[3]:
+
+
+# Load the JSON file
+file_path = 'TVs-all-merged.json'
+
+with open(file_path, 'r') as file:
+    Entire_Dataset = json.load(file)
+
+    
+print(len(Entire_Dataset))
+
+
+
+# Clean data 
+def clean_model_value(string):
+    replacements = {
+        '-inch': 'inch', ' inch': 'inch', 'inches': 'inch', '- inches': 'inch',
+        '-inches': 'inch', 'diag': 'diagonal', 'diag.': 'diagonal',
+        'diagonalonalonal': 'diagonal', 'diagonalonal': 'diagonal',
+        '\\': '', '\\,': '', '\\-': '', '(': '', ')': '', '-': ''
+    }
+    for old, new in replacements.items():
+        string = string.replace(old, new)
+    return string.strip()
+
+
+
+
+# Apply regex to include numeric-only model words
+def process_title(title: str):
+    model_words = re.findall(r'([a-zA-Z0-9]+(?:[0-9]+[^0-9, ]+)?(?:[^0-9, ]+[0-9]+)?[a-zA-Z0-9]*)', title)
+    cleaned_words = [clean_model_value(word) for word in model_words]
+    return set(cleaned_words)
+
+
+
+#Feature and key-value pair extraction
+def extract_features(product):
+    features = product.get('featuresMap', {})
+    processed_features = {}
+
+    processed_features['screen_size'] = float(features.get('Screen Size Class', '0').replace('"', ''))
+    processed_features['is_smart'] = 1 if features.get('Smart Capable', 'No') == 'Yes' else 0
+    processed_features['resolution'] = features.get('Maximum Resolution', 'Unknown')
+    processed_features['brand'] = features.get('Brand', 'No Brand Info')
+
+    for key, value in features.items():
+        processed_features[key] = value
+
+    return processed_features
+
+
+#Code that calls above function, cleans the data 
+def extract_and_process_data(data):
+    processed_data = []
+    for index, (model_id, product_list) in enumerate(data.items()):
+        for product in product_list:
+            title = product.get('title', '').lower()
+            shop = product.get('shop', 'No Shop Info')
+            title_processed = process_title(title)
+            features_processed = extract_features(product)
+
+            product_data = {
+                'model_id': model_id,
+                'shop': shop,
+                'index': index,
+                'title_processed': title_processed,
+                'features_processed': features_processed,
+            }
+            processed_data.append(product_data)
+    return processed_data
+
+processed_data = extract_and_process_data(Entire_Dataset)
+
+
+#Transforming titles in binary vectors 
+def one_hot_encode_titles(processed_data):
+    titles = [" ".join(title_set) for title_set in (product['title_processed'] for product in processed_data)]
+    vectorizer = CountVectorizer()
+    title_vectors = vectorizer.fit_transform(titles)
+    return title_vectors
+
+title_vectors = one_hot_encode_titles(processed_data)
+
+#Calculating qgram simularity between candidate pairs. 
+def qgram_similarity(str1, str2, q=3):
+    def generate_qgrams(string, q):
+        string = '#' * (q - 1) + string + '#' * (q - 1)
+        return set(string[i:i + q] for i in range(len(string) - q + 1))
+
+    qgrams1 = generate_qgrams(str1, q)
+    qgrams2 = generate_qgrams(str2, q)
+
+    intersection = qgrams1.intersection(qgrams2)
+    union = qgrams1.union(qgrams2)
+
+    return len(intersection) / len(union) if union else 1
+
+
+#Generating Key-Value pairs and applying q-gram similarity. 
+def kvp_similarity(product1, product2, q=3):
+    features1 = product1['features_processed']
+    features2 = product2['features_processed']
+
+    common_keys = set(features1.keys()).intersection(features2.keys())
+    if not common_keys:
+        return 0
+
+    similarity_scores = []
+
+    for key in common_keys:
+        value1 = str(features1[key]) 
+        value2 = str(features2[key])  
+        
+        sim_score = qgram_similarity(value1, value2, q)
+        similarity_scores.append(sim_score)
+
+    return sum(similarity_scores) / len(similarity_scores) if similarity_scores else 0
+
+
+# ## Locality Sensitive Hashing
+
+
+#Apply Minhashing and create signatures 
+class MinHash:
+    def __init__(self, num_permutations):
+        self.num_permutations = num_permutations
+        self.hash_values = None
+
+    def compute(self, matrix: csr_matrix):
+        num_rows, num_cols = matrix.shape
+        self.hash_values = np.full((num_rows, self.num_permutations), np.inf)
+
+        for i in range(self.num_permutations):
+            permutation = np.random.permutation(num_cols)
+            for row in range(num_rows):
+                row_indices = matrix[row].nonzero()[1]
+                if row_indices.size > 0:
+                    permuted_indices = permutation[row_indices]
+                    self.hash_values[row, i] = min(permuted_indices.min(), self.hash_values[row, i])
+
+        return self.hash_values
+    
+num_permutations = 600
+minhash = MinHash(num_permutations)
+minhash_signatures = minhash.compute(title_vectors)
+
+
+def compute_distance_matrix(vectors):
+    # Compute cosine similarity matrix
+    similarity_matrix = cosine_similarity(vectors)
+
+    distance_matrix = 1 - similarity_matrix
+
+    return distance_matrix
+
+distance_matrix = compute_distance_matrix(title_vectors)
+
+
+
+
+#Perform Agglomerative Clustering 
+def perform_clustering(data_matrix, distance_threshold=0.7):
+    clustering_model = AgglomerativeClustering(n_clusters=None, 
+                                               distance_threshold=distance_threshold, 
+                                               metric='precomputed',  
+                                               linkage='average')
+    clustering_model.fit(data_matrix)
+    return clustering_model.labels_
+
+cluster_labels = perform_clustering(distance_matrix)
+
+
+
+
+
+#Apply Locality sensitive Hashiing
+class LSH:
+    def __init__(self, num_bands):
+        self.num_bands = num_bands
+        self.buckets = [dict() for _ in range(num_bands)]
+
+    def make_subvectors(self, signature):
+        length = len(signature)
+        band_size = length // self.num_bands
+        subvecs = []
+
+        for i in range(self.num_bands):
+            start_index = i * band_size
+            if i == self.num_bands - 1:
+                end_index = length
+            else:
+                end_index = start_index + band_size
+            subvecs.append(signature[start_index:end_index])
+
+        return subvecs
+
+    def hash(self, minhash_signatures):
+        for i, signature in enumerate(minhash_signatures):
+            subvectors = self.make_subvectors(signature)
+            for j, subvec in enumerate(subvectors):
+                subvec_tuple = tuple(subvec)
+                if subvec_tuple not in self.buckets[j]:
+                    self.buckets[j][subvec_tuple] = []
+                self.buckets[j][subvec_tuple].append(i)
+        return self.buckets
+    
+
+num_bands = 60
+lsh = LSH(num_bands)
+lsh_buckets = lsh.hash(minhash_signatures)
+
+
+# # Generating Candidate pairs
+
+
+
+#Generate functions to check same brand and different shop 
+def diffBrand(product1, product2):
+    brand1 = product1['features_processed'].get('brand', 'No Brand Info').lower()
+    brand2 = product2['features_processed'].get('brand', 'No Brand Info').lower()
+
+    if brand1 == 'no brand info' or brand2 == 'no brand info':
+        return False
+    else:
+        return brand1 != brand2
+
+
+def different_shop(product1, product2):
+    return product1.get('shop', None) != product2.get('shop', None)
+
+
+
+#Generate Candidate pairs without applying brand and shop rule. 
+def generate_initial_candidate_pairs(lsh_buckets, processed_data, cluster_labels):
+    initial_candidate_pairs = set()
+    for bucket in lsh_buckets:
+        for indices in bucket.values():
+            if len(indices) > 1:
+                for pair in itertools.combinations(indices, 2):
+                    if cluster_labels[pair[0]] == cluster_labels[pair[1]]:  
+                        initial_candidate_pairs.add(pair)
+    return initial_candidate_pairs
+
+initial_candidate_pairs = generate_initial_candidate_pairs(lsh_buckets, processed_data, cluster_labels)
+
+
+def refine_candidate_pairs(candidate_pairs, processed_data):
+    refined_candidate_pairs = set()
+    for pair in candidate_pairs:
+        product1 = processed_data[pair[0]]
+        product2 = processed_data[pair[1]]
+        if not diffBrand(product1, product2) and different_shop(product1, product2):
+            refined_candidate_pairs.add(pair)
+    return refined_candidate_pairs
+
+refined_candidate_pairs = refine_candidate_pairs(initial_candidate_pairs, processed_data)
+print(len(refined_candidate_pairs))
+
+
+
+
+# Using updated KVP similarity with q-gram
+def calculate_similarity(product1, product2, title_vectors, q=3):
+    vec1 = title_vectors[product1['index']]
+    vec2 = title_vectors[product2['index']]
+    title_sim = cosine_similarity(vec1, vec2)[0][0]
+
+    kvp_sim = kvp_similarity(product1, product2, q)
+
+    combined_sim = (title_sim + kvp_sim) / 2  # Adjust weights as needed
+    return combined_sim
+
+
+# ## Evaluation Using Bootstrapping 
+
+
+def bootstrap(data_dict, sample_size):
+    keys = list(data_dict.keys())
+    sample_keys = random.choices(keys, k=sample_size)
+    return {key: data_dict[key] for key in sample_keys}
+
+
+
+
+def compute_metrics(tp, fp, fn, total_possible_comparisons, total_actual_duplicates, num_initial_candidate_pairs, real_duplicate_count, n_duplicates):
+    precision = tp / (tp + fp) if (tp + fp) != 0 else 0
+    recall = tp / (tp + fn) if (tp + fn) != 0 else 0
+    f1_score = 2 * precision * recall / (precision + recall) if (precision + recall) != 0 else 0
+    
+    pair_quality = tp / num_initial_candidate_pairs if num_initial_candidate_pairs != 0 else 0
+    pair_completeness = tp / total_actual_duplicates if total_actual_duplicates != 0 else 0
+    f1_star = 2 * pair_quality * pair_completeness / (pair_quality + pair_completeness) if (pair_quality + pair_completeness) != 0 else 0
+    fraction_of_comparisons = num_initial_candidate_pairs / total_possible_comparisons
+    
+    return {
+        'Precision': precision,
+        'Recall': recall,
+        'F1 Score': f1_score,
+        'Pair Quality': pair_quality,
+        'Pair Completeness': pair_completeness,
+        'F1 Star': f1_star,
+        'Fraction of Comparisons': fraction_of_comparisons
+    }
+
+
+
+
+def bootstrap_evaluation(data_dict, n_iterations, sample_size, num_permutations, num_bands, similarity_threshold):
+    metrics_aggregated = {
+        'Precision': [],
+        'Recall': [],
+        'F1 Score': [],
+        'Pair Quality': [],
+        'Pair Completeness': [],
+        'F1 Star': [],
+        'Fraction of Comparisons': []
+    }
+
+    for iteration in range(n_iterations):
+        # Sample data for bootstrap
+        sample_data = bootstrap(data_dict, sample_size)
+        processed_sample_data = extract_and_process_data(sample_data)
+
+        # One-hot encode titles
+        sample_title_vectors = one_hot_encode_titles(processed_sample_data)
+
+        # Compute MinHash signatures
+        sample_minhash = MinHash(num_permutations)
+        sample_minhash_signatures = sample_minhash.compute(sample_title_vectors)
+        
+        # Perform clusteing 
+        sample_distance_matrix = compute_distance_matrix(sample_title_vectors)
+        sample_cluster_labels = perform_clustering(distance_matrix)
+
+        # Perform LSH
+        sample_lsh = LSH(num_bands)
+        sample_lsh_buckets = sample_lsh.hash(sample_minhash_signatures)
+
+        # Generate candidate pairs
+        sample_initial_candidate_pairs = generate_initial_candidate_pairs(sample_lsh_buckets, processed_sample_data, sample_cluster_labels)
+        sample_refine_candidate_pairs = refine_candidate_pairs(sample_initial_candidate_pairs, processed_sample_data)
+
+        # Calculate the total number of possible comparisons
+        total_possible_comparisons = len(processed_sample_data) ** 2
+        num_candidate_pairs_sample = len(sample_refine_candidate_pairs)
+
+        # Calculate the total number of actual duplicates
+        model_ids = [product['model_id'] for product in processed_sample_data]
+        total_actual_duplicates = sum(1 for pair in combinations(model_ids, 2) if pair[0] == pair[1])
+        n_duplicates = sum(1 for pair in combinations(processed_sample_data, 2) if pair[0]['model_id'] == pair[1]['model_id'])
+
+        y_true, y_pred = [], []
+        real_duplicate_count = 0
+        for pair in sample_refine_candidate_pairs:
+            product1 = processed_sample_data[pair[0]]
+            product2 = processed_sample_data[pair[1]]
+            sim = calculate_similarity(product1, product2, sample_title_vectors)
+
+            # Check if the pair is an actual duplicate 
+            is_actual_duplicate = product1['model_id'] == product2['model_id']
+            is_predicted_duplicate = sim > similarity_threshold
+            
+            y_pred.append(int(is_predicted_duplicate))
+            y_true.append(int(is_actual_duplicate))
+            
+            if is_actual_duplicate and is_predicted_duplicate:
+                real_duplicate_count += 1
+
+        if y_true and y_pred and len(set(y_true)) > 1 and len(set(y_pred)) > 1:
+            tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
+        else:
+            tn, fp, fn, tp = 0, 0, 0, 0
+        
+        iteration_metrics = compute_metrics(tp, fp, fn, total_possible_comparisons, total_actual_duplicates, len(sample_refine_candidate_pairs), real_duplicate_count, n_duplicates)
+
+        for key in metrics_aggregated:
+            metrics_aggregated[key].append(iteration_metrics[key])
+
+    avg_metrics = {key: np.mean(values) for key, values in metrics_aggregated.items()}
+
+    return avg_metrics
+
+n_iterations = 5
+num_permutation = 600 
+num_bands = 60
+similarity_threshold = 0.6 
+sample_size = int(0.63 * len(Entire_Dataset))
+avg_metrics = bootstrap_evaluation(Entire_Dataset, n_iterations, sample_size, num_permutation, num_bands, similarity_threshold)
+print(f"Average metrics: {avg_metrics}")
+
+
+# ## Testing for different parameters 
+
+
+
+# Define ranges for parameters
+permutation_range = [300]
+band_range = [1,2,5,10,20,30,50,100,200] 
+threshold_range = [0.65]
+
+# Dictionary to store the results
+results = {}
+
+# Loop over different configurations
+for num_perm in permutation_range:
+    for num_band in band_range:
+        for threshold in threshold_range:
+            # Run evaluation
+            avg_metrics = bootstrap_evaluation(Entire_Dataset, n_iterations, sample_size, num_perm, num_band, threshold)
+
+            # Store results
+            config_key = (num_perm, num_band, threshold)
+            results[config_key] = avg_metrics
+
+            # Print the results with settings
+            print(f"Configuration: Permutations: {num_perm}, Bands: {num_band}, Threshold: {threshold}")
+            for metric, value in avg_metrics.items():
+                print(f"{metric}: {value:.5f}")  # Limit to 5 decimals
+            print("----------------------------------------------------")
+
+
+
+
+metrics_values = {
+    'Precision': [], 'Recall': [], 'F1 Score': [], 
+    'Pair Quality': [], 'Pair Completeness': [], 
+    'F1 Star': [], 'Fraction of Comparisons': []
+}
+
+for config, metrics in results.items():
+    for metric in metrics_values:
+        metrics_values[metric].append(metrics[metric])
+
+for metric, values in metrics_values.items():
+    print(f"{metric}: {values}")
+
+
+
+
+metrics_to_plot = ['F1 Score', 'Pair Quality', 'Pair Completeness', 'F1 Star']
+
+plot_data = {metric: {'x': [], 'y': []} for metric in metrics_to_plot}
+
+for (num_perm, num_band, threshold), metrics in results.items():
+    fraction_of_comparisons = metrics['Fraction of Comparisons']
+    for metric in metrics_to_plot:
+        plot_data[metric]['x'].append(fraction_of_comparisons)
+        plot_data[metric]['y'].append(metrics[metric])
+
+for metric in metrics_to_plot:
+    plt.figure(figsize=(10, 6))
+    plt.plot(plot_data[metric]['x'], plot_data[metric]['y'], marker='o') 
+    plt.xlabel('Fraction of Comparisons')
+    plt.ylabel(metric)
+    plt.title(f'{metric} vs Fraction of Comparisons')
+    plt.show()
+
+
+# ## Test code 400 perm
+
+
+
+permutation_range = [400]
+band_range = [1,2,5,10,20,30,50,100,200] 
+threshold_range = [0.65]
+
+results = {}
+
+for num_perm in permutation_range:
+    for num_band in band_range:
+        for threshold in threshold_range:
+            avg_metrics = bootstrap_evaluation(Entire_Dataset, n_iterations, sample_size, num_perm, num_band, threshold)
+
+            config_key = (num_perm, num_band, threshold)
+            results[config_key] = avg_metrics
+
+            print(f"Configuration: Permutations: {num_perm}, Bands: {num_band}, Threshold: {threshold}")
+            for metric, value in avg_metrics.items():
+                print(f"{metric}: {value:.5f}")  
+            print("----------------------------------------------------")
+
+
+
+
+
+metrics_values = {
+    'Precision': [], 'Recall': [], 'F1 Score': [], 
+    'Pair Quality': [], 'Pair Completeness': [], 
+    'F1 Star': [], 'Fraction of Comparisons': []
+}
+
+for config, metrics in results.items():
+    for metric in metrics_values:
+        metrics_values[metric].append(metrics[metric])
+
+for metric, values in metrics_values.items():
+    print(f"{metric}: {values}")
+
+
+
+
+metrics_to_plot = ['F1 Score', 'Pair Quality', 'Pair Completeness', 'F1 Star']
+
+plot_data = {metric: {'x': [], 'y': []} for metric in metrics_to_plot}
+
+for (num_perm, num_band, threshold), metrics in results.items():
+    fraction_of_comparisons = metrics['Fraction of Comparisons']
+    for metric in metrics_to_plot:
+        plot_data[metric]['x'].append(fraction_of_comparisons)
+        plot_data[metric]['y'].append(metrics[metric])
+
+for metric in metrics_to_plot:
+    plt.figure(figsize=(10, 6))
+    plt.plot(plot_data[metric]['x'], plot_data[metric]['y'], marker='o') # Using plot function with markers
+    plt.xlabel('Fraction of Comparisons')
+    plt.ylabel(metric)
+    plt.title(f'{metric} vs Fraction of Comparisons')
+    plt.show()
+
+
+# ### Test 600 perm for wich band
+
+
+
+permutation_range = [600]
+band_range = [20,40,50,60,70,100] 
+threshold_range = [0.65]
+
+results = {}
+
+for num_perm in permutation_range:
+    for num_band in band_range:
+        for threshold in threshold_range:
+            avg_metrics = bootstrap_evaluation(Entire_Dataset, n_iterations, sample_size, num_perm, num_band, threshold)
+
+            config_key = (num_perm, num_band, threshold)
+            results[config_key] = avg_metrics
+
+            print(f"Configuration: Permutations: {num_perm}, Bands: {num_band}, Threshold: {threshold}")
+            for metric, value in avg_metrics.items():
+                print(f"{metric}: {value:.5f}")  
+            print("----------------------------------------------------")
+
+
+
+
+metrics_values = {
+    'F1 Score': [], 
+    'Pair Quality': [], 'Pair Completeness': [], 
+    'F1 Star': [], 'Fraction of Comparisons': []
+}
+
+for config, metrics in results.items():
+    for metric in metrics_values:
+        metrics_values[metric].append(metrics[metric])
+
+for metric, values in metrics_values.items():
+    print(f"{metric}: {values}")
+
+
+
+
+metrics_to_plot = ['F1 Score', 'Pair Quality', 'Pair Completeness', 'F1 Star']
+
+plot_data = {metric: {'x': [], 'y': []} for metric in metrics_to_plot}
+
+for (num_perm, num_band, threshold), metrics in results.items():
+    fraction_of_comparisons = metrics['Fraction of Comparisons']
+    for metric in metrics_to_plot:
+        plot_data[metric]['x'].append(fraction_of_comparisons)
+        plot_data[metric]['y'].append(metrics[metric])
+
+for metric in metrics_to_plot:
+    plt.figure(figsize=(10, 6))
+    plt.plot(plot_data[metric]['x'], plot_data[metric]['y'], marker='o') # Using plot function with markers
+    plt.xlabel('Fraction of Comparisons')
+    plt.ylabel(metric)
+    plt.title(f'{metric} vs Fraction of Comparisons')
+    plt.show()
+
+
+# ### Test 600 en 50 bands for amount of tresholds
+
+
+
+permutation_range = [600]
+band_range = [1, 10, 20,30, 40,50,60,70,80,90,100, 200] 
+threshold_range = [0.5]
+
+results = {}
+
+for num_perm in permutation_range:
+    for num_band in band_range:
+        for threshold in threshold_range:
+            avg_metrics = bootstrap_evaluation(Entire_Dataset, n_iterations, sample_size, num_perm, num_band, threshold)
+
+            config_key = (num_perm, num_band, threshold)
+            results[config_key] = avg_metrics
+
+            print(f"Configuration: Permutations: {num_perm}, Bands: {num_band}, Threshold: {threshold}")
+            for metric, value in avg_metrics.items():
+                print(f"{metric}: {value:.5f}")  
+            print("----------------------------------------------------")
+
+
+metrics_values = {
+    'F1 Score': [], 
+    'Pair Quality': [], 'Pair Completeness': [], 
+    'F1 Star': [], 'Fraction of Comparisons': []
+}
+
+for config, metrics in results.items():
+    for metric in metrics_values:
+        metrics_values[metric].append(metrics[metric])
+
+for metric, values in metrics_values.items():
+    print(f"{metric}: {values}")
+
+
+
+metrics_to_plot = ['F1 Score', 'Pair Quality', 'Pair Completeness', 'F1 Star']
+
+plot_data = {metric: {'x': [], 'y': []} for metric in metrics_to_plot}
+
+for (num_perm, num_band, threshold), metrics in results.items():
+    fraction_of_comparisons = metrics['Fraction of Comparisons']
+    for metric in metrics_to_plot:
+        plot_data[metric]['x'].append(fraction_of_comparisons)
+        plot_data[metric]['y'].append(metrics[metric])
+
+for metric in metrics_to_plot:
+    plt.figure(figsize=(10, 6))
+    plt.plot(plot_data[metric]['x'], plot_data[metric]['y'], marker='o') # Using plot function with markers
+    plt.xlabel('Fraction of Comparisons')
+    plt.ylabel(metric)
+    plt.title(f'{metric} vs Fraction of Comparisons')
+    plt.show()
+
+
+
+permutation_range = [600]
+band_range = [1,5, 10,15,20,40,50,60,70,80,90,100,110,120,130,140,150] 
+threshold_range = [0.6]
+
+results = {}
+
+for num_perm in permutation_range:
+    for num_band in band_range:
+        for threshold in threshold_range:
+            avg_metrics = bootstrap_evaluation(Entire_Dataset, n_iterations, sample_size, num_perm, num_band, threshold)
+
+            config_key = (num_perm, num_band, threshold)
+            results[config_key] = avg_metrics
+
+            print(f"Configuration: Permutations: {num_perm}, Bands: {num_band}, Threshold: {threshold}")
+            for metric, value in avg_metrics.items():
+                print(f"{metric}: {value:.5f}")  
+            print("----------------------------------------------------")
+
+
+
+
+metrics_values = {
+    'F1 Score': [], 
+    'Pair Quality': [], 'Pair Completeness': [], 
+    'F1 Star': [], 'Fraction of Comparisons': []
+}
+
+for config, metrics in results.items():
+    for metric in metrics_values:
+        metrics_values[metric].append(metrics[metric])
+
+for metric, values in metrics_values.items():
+    print(f"{metric}: {values}")
+
+
+
+for metric in metrics_to_plot:
+    sorted_pairs = sorted(zip(plot_data[metric]['x'], plot_data[metric]['y']))
+    x_values, y_values = zip(*sorted_pairs)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(x_values, y_values)  
+    plt.xlabel('Fraction of Comparisons')
+    plt.ylabel(metric)
+    plt.title(f'{metric} vs Fraction of Comparisons')
+    plt.show()
+
+
+# Define ranges for parameters
+permutation_range = [1000]
+band_range = [1,5, 10,15,20,40,50,60,70,80,90,100,110,120,130,140,150] 
+threshold_range = [0.6]
+
+results = {}
+
+for num_perm in permutation_range:
+    for num_band in band_range:
+        for threshold in threshold_range:
+            avg_metrics = bootstrap_evaluation(Entire_Dataset, n_iterations, sample_size, num_perm, num_band, threshold)
+
+            config_key = (num_perm, num_band, threshold)
+            results[config_key] = avg_metrics
+
+            print(f"Configuration: Permutations: {num_perm}, Bands: {num_band}, Threshold: {threshold}")
+            for metric, value in avg_metrics.items():
+                print(f"{metric}: {value:.5f}")  # Limit to 5 decimals
+            print("----------------------------------------------------")
+
+
+
+
+metrics_values = {
+    'F1 Score': [], 
+    'Pair Quality': [], 'Pair Completeness': [], 
+    'F1 Star': [], 'Fraction of Comparisons': []
+}
+
+# Assuming configurations are stored as: results[(num_perm, num_band, threshold)] = metrics
+for config, metrics in results.items():
+    for metric in metrics_values:
+        metrics_values[metric].append(metrics[metric])
+
+for metric, values in metrics_values.items():
+    print(f"{metric}: {values}")
+
+
+
+
+for metric in metrics_to_plot:
+    sorted_pairs = sorted(zip(plot_data[metric]['x'], plot_data[metric]['y']))
+    x_values, y_values = zip(*sorted_pairs)
+
+    plt.figure(figsize=(10, 6))
+    plt.plot(x_values, y_values)  
+    plt.xlabel('Fraction of Comparisons')
+    plt.ylabel(metric)
+    plt.title(f'{metric} vs Fraction of Comparisons')
+    plt.show()
+
+
+
+
+
+
